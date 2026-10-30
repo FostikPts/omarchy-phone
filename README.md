@@ -1,5 +1,7 @@
 # Phone — ADB + scrcpy for Omarchy
 
+**English** | [Русский](README.ru.md)
+
 Bar widget and CLI for mirroring an Android phone over Wi-Fi. The phone serves
 the hotspot, so its IP is the gateway of the default route — the same address
 `ip route | grep default` prints. The plugin re-reads it on every run, so
@@ -14,7 +16,8 @@ and the window rule, then checks everything):
 curl -fsSL https://raw.githubusercontent.com/FostikPts/omarchy-phone/main/install.sh | bash
 ```
 
-Or do it by hand — see [INSTALL.md](INSTALL.md). Short version:
+Or do it by hand — see [INSTALL.md](INSTALL.md) (also in
+[Russian](INSTALL.ru.md)). Short version:
 
 ```bash
 omarchy pkg add android-tools scrcpy
