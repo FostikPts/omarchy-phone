@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "admin.phone",
   "name": "Phone",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "admin",
   "description": "Android phone integration over Wi-Fi: ADB + scrcpy with the phone IP detected from the default route, so it survives hotspot IP changes.",
   "kinds": [
