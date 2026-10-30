@@ -7,7 +7,14 @@ toggling the hotspot (and the new IP that comes with it) needs no manual step.
 
 ## Install
 
-Fresh machine — follow [INSTALL.md](INSTALL.md). Short version:
+One command (installs packages, the plugin, the CLI symlink, the keybindings
+and the window rule, then checks everything):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FostikPts/omarchy-phone/main/install.sh | bash
+```
+
+Or do it by hand — see [INSTALL.md](INSTALL.md). Short version:
 
 ```bash
 omarchy pkg add android-tools scrcpy
