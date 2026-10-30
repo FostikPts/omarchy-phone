@@ -69,6 +69,7 @@ Usage: omarchy-phone <command>
   auto                   Silent reconnect (used by the bar widget and the
                          post-boot hook; only reconnects a phone seen before)
   devices                Raw `adb devices` output
+  doctor                 Check dependencies, keybinding, network and the phone
 
 Config: ~/.config/omarchy-phone/config
 USAGE
@@ -814,6 +815,103 @@ cmd_devices() {
   timeout 10 adb devices -l
 }
 
+# ---- doctor ---------------------------------------------------------------
+
+cmd_doctor() {
+  local self dir plugin problems=0 ip serial
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  dir=$(dirname "$self")
+  plugin=$(dirname "$dir")
+
+  printf 'omarchy-phone doctor\n'
+  printf 'script:  %s\n' "$self"
+  printf 'state:   %s\n\n' "$STATE_DIR"
+
+  if command -v adb >/dev/null 2>&1; then
+    printf '  [ok]    adb      %s\n' "$(command -v adb)"
+  else
+    printf '  [FAIL]  adb is missing — omarchy pkg add android-tools\n'
+    problems=$((problems + 1))
+  fi
+
+  if command -v scrcpy >/dev/null 2>&1; then
+    printf '  [ok]    scrcpy   %s\n' "$(scrcpy --version 2>/dev/null | head -n 1)"
+  else
+    printf '  [FAIL]  scrcpy is missing — omarchy pkg add scrcpy\n'
+    problems=$((problems + 1))
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '  [ok]    python3  %s\n' "$(command -v python3)"
+  else
+    printf '  [warn]  python3 is missing — the window watcher will not run\n'
+  fi
+
+  if [[ -x ${HOME}/.local/bin/omarchy-phone ]]; then
+    printf '  [ok]    %s\n' "$HOME/.local/bin/omarchy-phone"
+  else
+    printf '  [warn]  no ~/.local/bin/omarchy-phone — the keybinding needs it:\n'
+    printf '          ln -sf %s/bin/omarchy-phone ~/.local/bin/omarchy-phone\n' "$plugin"
+  fi
+
+  if grep -qs 'omarchy-phone' "${HOME}/.config/hypr/bindings.lua" 2>/dev/null; then
+    printf '  [ok]    Hyprland keybinding\n'
+  else
+    printf '  [warn]  no keybinding — add to ~/.config/hypr/bindings.lua:\n'
+    printf '          o.bind("SUPER + SHIFT + P", "Mirror phone", "omarchy-phone mirror")\n'
+  fi
+
+  if grep -qs 'scrcpy' "${HOME}/.config/hypr/windows.lua" 2>/dev/null; then
+    printf '  [ok]    scrcpy window rule\n'
+  else
+    printf '  [warn]  no scrcpy window rule in ~/.config/hypr/windows.lua\n'
+    printf '          (the mirror window will tile and will not follow rotation)\n'
+  fi
+
+  if command -v omarchy >/dev/null 2>&1 &&
+    omarchy plugin list 2>/dev/null | awk '$1 == "admin.phone" { found = 1 } END { exit !found }'; then
+    printf '  [ok]    plugin enabled in Omarchy\n'
+  else
+    printf '  [warn]  plugin not listed as enabled — omarchy plugin enable admin.phone\n'
+  fi
+
+  printf '\n'
+  ip=$(detect_ip 2>/dev/null) || ip=""
+  if [[ -n $ip ]]; then
+    printf '  default route: %s\n' "$ip"
+    if ! command -v adb >/dev/null 2>&1; then
+      :
+    else
+      serial=$(online_serial_for_ip "$ip" 2>/dev/null)
+      if [[ -n $serial ]]; then
+        printf '  [ok]    phone online: %s\n' "$serial"
+      else
+        printf '  [FAIL]  nothing answers at %s\n' "$ip"
+        printf '          The plugin assumes the PHONE serves the hotspot, so the phone IS\n'
+        printf '          the default gateway. If the phone is on the same Wi-Fi as this PC\n'
+        printf '          instead, use: omarchy-phone pair\n'
+        problems=$((problems + 1))
+      fi
+    fi
+  else
+    printf '  [FAIL]  no default route — no network at all\n'
+    problems=$((problems + 1))
+  fi
+
+  if command -v adb >/dev/null 2>&1; then
+    printf '\n  adb devices:\n'
+    timeout 10 adb devices 2>/dev/null | sed -n '2,$p' | sed 's/^/    /'
+  fi
+
+  printf '\n'
+  if ((problems == 0)); then
+    printf 'No hard problems found.\n'
+    return 0
+  fi
+  printf '%d problem(s) found — see the lines marked [FAIL].\n' "$problems"
+  return 1
+}
+
 # ---- dispatch -------------------------------------------------------------
 
 case "${1:-help}" in
@@ -828,6 +926,7 @@ case "${1:-help}" in
   pair) shift; cmd_pair "${1:-}" "${2:-}" ;;
   auto) shift; cmd_auto ;;
   devices) shift; cmd_devices ;;
+  doctor) shift; cmd_doctor ;;
   help | -h | --help) usage ;;
   *)
     printf 'omarchy-phone: unknown command: %s\n\n' "$1" >&2

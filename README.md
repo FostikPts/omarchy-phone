@@ -5,6 +5,27 @@ the hotspot, so its IP is the gateway of the default route — the same address
 `ip route | grep default` prints. The plugin re-reads it on every run, so
 toggling the hotspot (and the new IP that comes with it) needs no manual step.
 
+## Install
+
+Fresh machine — follow [INSTALL.md](INSTALL.md). Short version:
+
+```bash
+omarchy pkg add android-tools scrcpy
+omarchy plugin add https://github.com/FostikPts/omarchy-phone.git --enable
+ln -sf ~/.config/omarchy/plugins/admin.phone/bin/omarchy-phone ~/.local/bin/omarchy-phone
+```
+
+Then add the keybinding and the scrcpy window rule (INSTALL.md, steps 4-5) and
+check everything at once:
+
+```bash
+omarchy-phone doctor
+```
+
+**The plugin assumes the phone serves the hotspot** (the phone is the default
+gateway). If the phone is on the same Wi-Fi as the computer instead, pair once:
+`omarchy-phone pair`, then `omarchy-phone mirror`.
+
 ## Layout
 
 ```
@@ -23,6 +44,7 @@ toggling the hotspot (and the new IP that comes with it) needs no manual step.
 omarchy-phone ip                # detected phone IP (default-route gateway)
 omarchy-phone ip --notify       # same, as a notification
 omarchy-phone status [--json]   # state for scripts and the widget
+omarchy-phone doctor             # check deps, keybinding, network, phone
 omarchy-phone connect           # ADB over Wi-Fi
 omarchy-phone disconnect        # drop Wi-Fi ADB connections
 omarchy-phone mirror            # connect if needed, then scrcpy
