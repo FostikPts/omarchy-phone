@@ -108,9 +108,18 @@ rotation / Connect / Disconnect / Show IP / Pair.
 
 ## Keybinding
 
-`SUPER + SHIFT + P` mirrors the phone (`omarchy-phone mirror`). The previous
-Google Photos webapp binding was moved to `SUPER + ALT + P` in
-`~/.config/hypr/bindings.lua`.
+| Key | Command |
+|---|---|
+| `SUPER + SHIFT + P` | `omarchy-phone mirror` — connect and mirror |
+| `SUPER + SHIFT + U` | `omarchy-phone usb` — enable ADB over Wi-Fi using the USB cable |
+| `SUPER + SHIFT + R` | `omarchy-phone view` — turn the mirror image by 90° |
+
+All three report through desktop notifications, so they work without a
+terminal. The Google Photos webapp binding lives on `SUPER + ALT + P`.
+
+`mirror` already bootstraps over USB on its own: if the phone is plugged in
+and not reachable over Wi-Fi yet, it runs `adb tcpip 5555` first. The `U` key
+is for doing only that step, e.g. to enable Wi-Fi ADB once and then unplug.
 
 ## Config
 

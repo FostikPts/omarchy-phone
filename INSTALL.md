@@ -32,6 +32,7 @@ ln -sf ~/.config/omarchy/plugins/admin.phone/bin/omarchy-phone ~/.local/bin/omar
 
 ```lua
 o.bind("SUPER + SHIFT + P", "Mirror phone", "omarchy-phone mirror")
+o.bind("SUPER + SHIFT + U", "Phone over USB", "omarchy-phone usb")
 o.bind("SUPER + SHIFT + R", "Rotate mirror view", "omarchy-phone view")
 ```
 
