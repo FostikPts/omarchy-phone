@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "admin.phone",
+  "name": "Phone",
+  "version": "1.0.0",
+  "author": "admin",
+  "description": "Android phone integration over Wi-Fi: ADB + scrcpy with the phone IP detected from the default route, so it survives hotspot IP changes.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Phone",
+    "description": "Connect ADB over Wi-Fi, mirror the screen with scrcpy, auto-reconnect after the hotspot IP changes",
+    "category": "System",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+# omarchy-phone — phone integration for Omarchy: ADB over Wi-Fi + scrcpy.
+#
+# The phone serves the hotspot, so its address is the gateway of the default
+# route. That address changes every time the hotspot is toggled, so the IP is
+# re-read on every run instead of being hardcoded:
+#
+#   ip route show default  ->  "default via <phone ip> dev wlp3s0 ..."
+#
+# Wireless ADB is reached in this order:
+#   1. an address already online in `adb devices`
+#   2. an mDNS service for the gateway (Android 11+ Wireless debugging)
+#   3. the classic tcpip port (5555)
+#   4. `adb tcpip 5555` over USB when the phone is plugged in
+#
+# Config: ~/.config/omarchy-phone/config (KEY=value, see below)
+# State:  ~/.local/state/omarchy-phone/
+
+set -uo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-phone/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-phone"
+STATE_FILE="$STATE_DIR/state"
+VIEW_FILE="$STATE_DIR/view"
+LOG_FILE="$STATE_DIR/phone.log"
+
+# ---- defaults (override in $CONFIG_FILE) -----------------------------------
+# ADB_PORT=5555                  # classic wireless adb port
+# PHONE_IFACE=""                 # force a network interface, e.g. wlp3s0
+# SCRCPY_ARGS="--stay-awake --window-title=Phone --window-borderless --shortcut-mod=lctrl"
+# AUTO_RECONNECT=1               # "auto" reconnects a phone seen before
+# NOTIFY=1                       # desktop notifications
+#
+# --turn-screen-off is deliberately not used: the screen must stay on so the
+# phone keeps following its accelerometer when it is turned sideways.
+# --shortcut-mod=lctrl avoids the Alt/Super combinations Omarchy already uses.
+ADB_PORT=5555
+PHONE_IFACE=""
+SCRCPY_ARGS="--stay-awake --window-title=Phone --window-borderless --shortcut-mod=lctrl"
+AUTO_RECONNECT=1
+NOTIFY=1
+
+# shellcheck source=/dev/null
+[[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
+
+QUIET=0
+CONNECTED_SERIAL=""
+
+usage() {
+  cat <<'USAGE'
+omarchy-phone — ADB over Wi-Fi + scrcpy, with the phone IP taken from the
+default route (the phone is the hotspot gateway).
+
+Usage: omarchy-phone <command>
+
+  ip                     Print the detected phone IP
+  ip --notify            Same, as a desktop notification
+  status [--json]        Show the current state
+  connect                Connect ADB over Wi-Fi (USB bootstrap when possible)
+  disconnect             Drop all Wi-Fi ADB connections
+  mirror                 Connect if needed, then launch scrcpy
+  view [mode]            Turn the mirror image by 90° (default) or to 0,
+                         90, 180, 270 without rotating the phone screen
+  rotate [mode]          Rotate the phone screen: toggle (default), portrait,
+                         landscape, auto (accelerometer) or follow (toggle
+                         auto-rotate on and off).
+  usb                    Enable ADB over Wi-Fi using the USB cable
+  pair [addr] [code]     Pair with Android 11+ Wireless debugging
+  auto                   Silent reconnect (used by the bar widget and the
+                         post-boot hook; only reconnects a phone seen before)
+  devices                Raw `adb devices` output
+
+Config: ~/.config/omarchy-phone/config
+USAGE
+}
+
+# ---- logging / notifications ----------------------------------------------
+
+log() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+  if [[ $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 200000 ]]; then
+    tail -n 500 "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+notify_raw() {
+  ((NOTIFY)) || return 0
+  command -v omarchy-notification-send >/dev/null 2>&1 || return 0
+  omarchy-notification-send "Phone" "$1" -g $'\uf011c' >/dev/null 2>&1 || true
+}
+
+notify() {
+  ((QUIET)) && return 0
+  notify_raw "$1"
+}
+
+fail() {
+  printf 'omarchy-phone: %s\n' "$1" >&2
+  log "error: $1"
+  notify "$1"
+  return 1
+}
+
+require_adb() {
+  command -v adb >/dev/null 2>&1 && return 0
+  fail "adb not found — install it with: omarchy pkg add android-tools"
+}
+
+json_escape() {
+  local s=${1-}
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/ }
+  s=${s//$'\r'/}
+  s=${s//$'\t'/ }
+  printf '%s' "$s"
+}
+
+# ---- phone IP detection ---------------------------------------------------
+
+# Prints the gateway of the default route. Prefers a wireless interface, so a
+# VPN or a docker bridge cannot shadow the phone hotspot. Falls back to the
+# first default route, which is what `ip route | grep default` shows.
+detect_ip() {
+  local routes line via dev first_via="" first_dev=""
+  local -a f
+
+  routes=$(ip -4 route show default 2>/dev/null) || return 1
+  [[ -n $routes ]] || return 1
+
+  while IFS= read -r line; do
+    read -r -a f <<<"$line"
+    via=""
+    dev=""
+    for ((i = 0; i < ${#f[@]}; i++)); do
+      [[ ${f[i]} == via ]] && via=${f[i + 1]:-}
+      [[ ${f[i]} == dev ]] && dev=${f[i + 1]:-}
+    done
+    [[ -n $via ]] || continue
+
+    [[ -n $first_via ]] || { first_via=$via; first_dev=$dev; }
+
+    if [[ -n $PHONE_IFACE ]]; then
+      [[ $dev == "$PHONE_IFACE" ]] && { printf '%s\n' "$via"; return 0; }
+    elif [[ -n $dev && -d /sys/class/net/$dev/wireless ]]; then
+      printf '%s\n' "$via"
+      return 0
+    fi
+  done <<<"$routes"
+
+  # An explicit PHONE_IFACE is a hard filter: better to report "no phone" than
+  # to silently use a different interface's gateway.
+  [[ -z $PHONE_IFACE && -n $first_via ]] || return 1
+  printf '%s\n' "$first_via"
+}
+
+iface_for_ip() {
+  local ip=${1-} line dev
+  local -a f
+  [[ -n $ip ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == *"$ip"* ]] || continue
+    read -r -a f <<<"$line"
+    for ((i = 0; i < ${#f[@]}; i++)); do
+      [[ ${f[i]} == dev ]] && { printf '%s\n' "${f[i + 1]:-}"; return 0; }
+    done
+  done < <(ip -4 route show default 2>/dev/null)
+  return 1
+}
+
+# ---- adb helpers ----------------------------------------------------------
+
+adb_devices() {
+  timeout 10 adb devices 2>/dev/null |
+    awk 'NR > 1 && $1 !~ /^\*/ && NF >= 2 { print $1 "\t" $2 }'
+}
+
+online_serial_for_ip() {
+  local ip=${1-}
+  adb_devices | awk -v prefix="$ip:" 'index($1, prefix) == 1 && $2 == "device" { print $1; exit }'
+}
+
+serial_for_ip() {
+  local ip=${1-}
+  adb_devices | awk -v prefix="$ip:" 'index($1, prefix) == 1 { print $1; exit }'
+}
+
+serial_state() {
+  local serial=${1-}
+  adb_devices | awk -v s="$serial" '$1 == s { print $2; exit }'
+}
+
+usb_serial() {
+  adb_devices | awk '$1 !~ /:/ && $2 == "device" { print $1; exit }'
+}
+
+wait_online() {
+  local addr=${1-} tries=${2:-12} i state
+  for ((i = 0; i < tries; i++)); do
+    state=$(timeout 5 adb -s "$addr" get-state 2>/dev/null)
+    [[ $state == device ]] && return 0
+    sleep 0.4
+  done
+  return 1
+}
+
+# Prints "WxH" for display 0 (the phone screen scrcpy mirrors).
+display_real_size() {
+  local serial=${1-} out
+  out=$(timeout 8 adb -s "$serial" shell cmd display get-displays 2>/dev/null) || return 1
+  awk '
+    /DisplayInfo\{/ && /displayId 0,/ {
+      if (match($0, /real [0-9]+ x [0-9]+/)) {
+        size = substr($0, RSTART + 5, RLENGTH - 5)
+        gsub(/ /, "", size)
+        print size
+        exit
+      }
+    }' <<<"$out"
+}
+
+keyguard_showing() {
+  local serial=${1-}
+  timeout 8 adb -s "$serial" shell dumpsys window policy 2>/dev/null |
+    grep -q 'showing=true'
+}
+
+# "false" unless the system was told to ignore app orientation requests.
+rotation_ignore() {
+  local serial=${1-}
+  timeout 8 adb -s "$serial" shell wm get-ignore-orientation-request -d 0 2>/dev/null |
+    tr -d '\r' | awk '{print $2; exit}'
+}
+
+mdns_addr_for() {
+  local ip=${1-} svc=${2:-} out
+  out=$(timeout 8 adb mdns services 2>/dev/null) || return 1
+  [[ -n $out ]] || return 1
+  awk -v ip="$ip" -v svc="$svc" '
+    {
+      if (svc != "" && index($0, svc) == 0) next
+      addr = $NF
+      n = split(addr, p, ":")
+      if (n == 2 && p[1] == ip) { print addr; exit }
+    }' <<<"$out"
+}
+
+mdns_any() {
+  local svc=${1:-} out
+  out=$(timeout 8 adb mdns services 2>/dev/null) || return 1
+  [[ -n $out ]] || return 1
+  awk -v svc="$svc" '
+    {
+      if (svc != "" && index($0, svc) == 0) next
+      addr = $NF
+      n = split(addr, p, ":")
+      if (n == 2) { print addr; exit }
+    }' <<<"$out"
+}
+
+# ---- state ----------------------------------------------------------------
+
+save_state() {
+  local ip=${1-} serial=${2-}
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf 'ip=%s\nserial=%s\nat=%s\n' "$ip" "$serial" "$(date +%s)" >"$STATE_FILE" 2>/dev/null || true
+}
+
+clear_state() {
+  rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+state_serial() {
+  sed -n 's/^serial=//p' "$STATE_FILE" 2>/dev/null | head -n 1
+}
+
+# ---- connect --------------------------------------------------------------
+
+try_addr() {
+  local addr=${1-} out
+  out=$(timeout 20 adb connect "$addr" 2>&1) || true
+  log "adb connect $addr -> ${out:-<no output>}"
+  wait_online "$addr"
+}
+
+finish_connect() {
+  local ip=${1-} serial=${2-}
+  CONNECTED_SERIAL=$serial
+  save_state "$ip" "$serial"
+  printf 'Connected to %s\n' "$serial"
+  notify "Connected to $serial"
+}
+
+bootstrap_usb() {
+  local usb
+  usb=$(usb_serial)
+  [[ -n $usb ]] || return 1
+  log "enabling tcpip $ADB_PORT on USB device $usb"
+  timeout 25 adb -s "$usb" tcpip "$ADB_PORT" >/dev/null 2>&1 || return 1
+  sleep 2
+}
+
+connect_impl() {
+  local ip=${1-} serial addr
+
+  [[ -n $ip ]] || return 1
+
+  serial=$(online_serial_for_ip "$ip")
+  if [[ -n $serial ]]; then
+    CONNECTED_SERIAL=$serial
+    save_state "$ip" "$serial"
+    return 0
+  fi
+
+  # Drop stale/offline handles for this address, otherwise adb keeps reusing
+  # them after the hotspot comes back with the same IP.
+  while IFS=$'\t' read -r serial state; do
+    [[ -n ${serial:-} && $serial == "$ip":* ]] || continue
+    log "dropping stale $serial ($state)"
+    timeout 5 adb disconnect "$serial" >/dev/null 2>&1 || true
+  done < <(adb_devices)
+
+  # Android 11+ Wireless debugging advertises a random port over mDNS.
+  addr=$(mdns_addr_for "$ip" "_adb-tls-connect._tcp") || addr=""
+  if [[ -n $addr ]] && try_addr "$addr"; then
+    finish_connect "$ip" "$addr"
+    return 0
+  fi
+
+  # Classic `adb tcpip` port.
+  addr="$ip:$ADB_PORT"
+  if try_addr "$addr"; then
+    finish_connect "$ip" "$addr"
+    return 0
+  fi
+
+  # Last resort: bootstrap wireless adb from the USB cable.
+  if bootstrap_usb && try_addr "$addr"; then
+    finish_connect "$ip" "$addr"
+    return 0
+  fi
+
+  return 1
+}
+
+# ---- commands -------------------------------------------------------------
+
+cmd_ip() {
+  local ip flag=${1:-}
+  ip=$(detect_ip) || {
+    printf 'omarchy-phone: no default route found — is the phone hotspot on?\n' >&2
+    return 1
+  }
+  [[ $flag == --notify ]] && notify_raw "Phone IP: $ip"
+  printf '%s\n' "$ip"
+}
+
+cmd_status() {
+  local want_json=0 ip="" iface="" serial="" state="disconnected" model=""
+  local b_follow=false ws=""
+  local b_connected=false b_mirroring=false b_has_state=false b_adb=false b_scrcpy=false
+  [[ ${1:-} == --json || ${1:-} == json ]] && want_json=1
+
+  ip=$(detect_ip 2>/dev/null) || ip=""
+  [[ -n $ip ]] && iface=$(iface_for_ip "$ip" 2>/dev/null)
+
+  if [[ -n $ip ]]; then
+    serial=$(online_serial_for_ip "$ip")
+    if [[ -n $serial ]]; then
+      state="device"
+      b_connected=true
+      model=$(timeout 6 adb -s "$serial" shell getprop ro.product.model 2>/dev/null | tr -d '\r' | head -n 1)
+    else
+      serial=$(serial_for_ip "$ip")
+      if [[ -n $serial ]]; then
+        state=$(serial_state "$serial")
+        [[ -n $state ]] || state="offline"
+      fi
+    fi
+  fi
+
+  if [[ -n $serial ]] && pgrep -f -- "scrcpy -s $serial" >/dev/null 2>&1; then
+    b_mirroring=true
+  fi
+
+  if [[ $b_connected == true && -n $serial ]]; then
+    [[ $(timeout 8 adb -s "$serial" shell settings get system accelerometer_rotation 2>/dev/null | tr -d '\r' | head -n 1) == 1 ]] && b_follow=true
+  fi
+  if [[ $b_mirroring == true ]]; then
+    ws=$(mirror_workspace)
+  fi
+
+  [[ -f $STATE_FILE ]] && b_has_state=true
+  command -v adb >/dev/null 2>&1 && b_adb=true
+  command -v scrcpy >/dev/null 2>&1 && b_scrcpy=true
+
+  if ((want_json)); then
+    printf '{"ip":"%s","iface":"%s","serial":"%s","connected":%s,"state":"%s","model":"%s","mirroring":%s,"hasState":%s,"adb":%s,"scrcpy":%s,"port":"%s","view":%s,"follow":%s,"workspace":"%s"}\n' \
+      "$(json_escape "$ip")" \
+      "$(json_escape "$iface")" \
+      "$(json_escape "$serial")" \
+      "$b_connected" \
+      "$(json_escape "$state")" \
+      "$(json_escape "$model")" \
+      "$b_mirroring" \
+      "$b_has_state" \
+      "$b_adb" \
+      "$b_scrcpy" \
+      "$ADB_PORT" \
+      "$(view_angle)" \
+      "$b_follow" \
+      "$(json_escape "$ws")"
+    return 0
+  fi
+
+  printf 'Phone IP:  %s\n' "${ip:-<no default route>}"
+  [[ -n $iface ]] && printf 'Interface: %s\n' "$iface"
+  if [[ -n $serial ]]; then
+    printf 'ADB:       %s (%s)%s\n' "$serial" "$state" "${model:+ — $model}"
+  else
+    printf 'ADB:       not connected\n'
+  fi
+  printf 'scrcpy:    %s\n' "$([[ $b_mirroring == true ]] && echo running || echo stopped)"
+  printf 'view:      %s°\n' "$(view_angle)"
+  printf 'follow:    %s\n' "$([[ $b_follow == true ]] && echo 'auto-rotate on' || echo 'locked')"
+  [[ -n $ws ]] && printf 'workspace: %s\n' "$ws"
+}
+
+cmd_connect() {
+  require_adb || return 1
+  local ip
+  ip=$(detect_ip) || {
+    fail "no default route found — is the phone hotspot on?"
+    return 1
+  }
+  connect_impl "$ip" && return 0
+  fail "no phone answered at $ip. Plug in USB once and run 'omarchy-phone usb', or enable Wireless debugging and run 'omarchy-phone pair'."
+  return 1
+}
+
+cmd_disconnect() {
+  local serial state ip current
+  require_adb || return 1
+
+  ip=$(detect_ip 2>/dev/null) || ip=""
+  current=$(state_serial)
+
+  # Only drop the phone on this hotspot (the default-route gateway) and the
+  # serial we remember, so other network ADB devices are left alone.
+  while IFS=$'\t' read -r serial state; do
+    [[ -n ${serial:-} && $serial == *:* ]] || continue
+    [[ $serial == "$ip":* || $serial == "$current" ]] || continue
+    timeout 5 adb disconnect "$serial" >/dev/null 2>&1 || true
+    log "disconnected $serial ($state)"
+  done < <(adb_devices)
+
+  clear_state
+  printf 'Disconnected.\n'
+  notify "Disconnected"
+}
+
+ensure_serial() {
+  local ip serial
+  ip=$(detect_ip) || return 1
+  serial=$(online_serial_for_ip "$ip")
+  if [[ -z $serial ]]; then
+    connect_impl "$ip" >/dev/null
+    serial=$(online_serial_for_ip "$ip")
+  fi
+  [[ -n $serial ]] || return 1
+  printf '%s\n' "$serial"
+}
+
+# The watcher re-fits the scrcpy window after the phone rotates. Hyprland does
+# not let scrcpy resize itself, so the compositor has to do it.
+start_watch() {
+  local serial=${1-} pid_file="$STATE_DIR/watch.pid" old="" watcher script_dir
+  [[ -n $serial ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # Resolve the symlink in ~/.local/bin back to the plugin folder.
+  script_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd) || return 0
+  watcher="$script_dir/phone-watch.py"
+  [[ -x $watcher ]] || return 0
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  [[ -f $pid_file ]] && old=$(cat "$pid_file" 2>/dev/null || true)
+  if [[ -n $old ]] && kill -0 "$old" 2>/dev/null &&
+    grep -qa phone-watch.py "/proc/$old/cmdline" 2>/dev/null; then
+    return 0
+  fi
+
+  exec 8>>"$STATE_DIR/watch.lock" 2>/dev/null || return 0
+  command -v flock >/dev/null 2>&1 && { flock -n 8 || return 0; }
+
+  setsid -f "$watcher" --serial "$serial" --pid-file "$pid_file" --view "$(view_angle)" >>"$LOG_FILE" 2>&1
+}
+
+# Workspace of the scrcpy window (empty when it is not mirrored).
+mirror_workspace() {
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  hyprctl clients -j 2>/dev/null | python3 -c 'import json, sys
+try:
+    clients = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for client in clients:
+    if client.get("class") == "scrcpy":
+        print((client.get("workspace") or {}).get("id", ""))
+        break' 2>/dev/null
+}
+
+# ---- mirror view ----------------------------------------------------------
+# `rotate` turns the Android screen (the phone follows). `view` turns only the
+# image inside the scrcpy window: the phone keeps its own orientation while the
+# window shows it sideways. scrcpy reads the orientation at start-up, so the
+# angle is remembered and the window is recreated with --display-orientation.
+
+view_angle() {
+  local angle=""
+  [[ -r $VIEW_FILE ]] && angle=$(head -n 1 "$VIEW_FILE" 2>/dev/null)
+  case $angle in
+    0 | 90 | 180 | 270) printf '%s' "$angle" ;;
+    *) printf '0' ;;
+  esac
+}
+
+set_view_angle() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$1" >"$VIEW_FILE" 2>/dev/null || true
+}
+
+# Serial of the scrcpy instance mirroring right now (empty when none runs).
+mirror_serial() {
+  local pid
+  pid=$(pgrep -f -- "scrcpy -s " 2>/dev/null | head -n 1) || true
+  [[ -n ${pid:-} ]] || return 0
+  tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | awk '/^-s$/ { getline; print; exit }'
+}
+
+launch_scrcpy() {
+  local serial=${1-} angle
+  local -a extra=()
+  read -r -a extra <<<"$SCRCPY_ARGS"
+  angle=$(view_angle)
+  [[ $angle != 0 ]] && extra+=("--display-orientation=$angle")
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  setsid -f scrcpy -s "$serial" "${extra[@]}" >>"$LOG_FILE" 2>&1
+  start_watch "$serial"
+}
+
+cmd_view() {
+  local mode=${1:-toggle} current target serial attempt watcher
+  current=$(view_angle)
+  case $mode in
+    toggle) target=$(((current + 90) % 360)) ;;
+    0 | 90 | 180 | 270) target=$mode ;;
+    *)
+      fail "unknown view '$mode' (use toggle, 0, 90, 180 or 270)"
+      return 1
+      ;;
+  esac
+
+  set_view_angle "$target"
+  serial=$(mirror_serial)
+  if [[ -z $serial ]]; then
+    printf 'View %s° saved — it is used on the next mirror\n' "$target"
+    notify "Mirror view: $target°"
+    return 0
+  fi
+
+  watcher=$(cat "$STATE_DIR/watch.pid" 2>/dev/null || true)
+  [[ -n $watcher ]] && kill "$watcher" 2>/dev/null
+  pkill -f -- "scrcpy -s $serial" 2>/dev/null
+  for attempt in 1 2 3 4 5 6; do
+    pgrep -f -- "scrcpy -s $serial" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  launch_scrcpy "$serial"
+  printf 'View %s°\n' "$target"
+  notify "Mirror view: $target°"
+}
+
+cmd_mirror() {
+  local ip serial
+  require_adb || return 1
+  command -v scrcpy >/dev/null 2>&1 || {
+    fail "scrcpy not found — install it with: omarchy pkg add scrcpy"
+    return 1
+  }
+
+  ip=$(detect_ip) || {
+    fail "no default route found — is the phone hotspot on?"
+    return 1
+  }
+
+  serial=$(online_serial_for_ip "$ip")
+  if [[ -z $serial ]]; then
+    connect_impl "$ip" >/dev/null
+    serial=$(online_serial_for_ip "$ip")
+  fi
+  [[ -n $serial ]] || {
+    fail "could not reach the phone at $ip"
+    return 1
+  }
+
+  if pgrep -f -- "scrcpy -s $serial" >/dev/null 2>&1; then
+    start_watch "$serial"
+    printf 'Already mirroring %s\n' "$serial"
+    notify_raw "Already mirroring $serial"
+    return 0
+  fi
+
+  launch_scrcpy "$serial"
+  printf 'Mirroring %s\n' "$serial"
+  notify_raw "Mirroring $serial"
+}
+
+cmd_rotate() {
+  local mode=${1:-toggle} serial size width height target label new
+  local was_auto was_rotation was_ignore
+  require_adb || return 1
+
+  serial=$(ensure_serial) || {
+    fail "could not reach the phone"
+    return 1
+  }
+
+  case $mode in
+    auto)
+      timeout 8 adb -s "$serial" shell wm set-ignore-orientation-request -d 0 false >/dev/null 2>&1 || true
+      timeout 8 adb -s "$serial" shell settings put system accelerometer_rotation 1 >/dev/null 2>&1 || true
+      timeout 8 adb -s "$serial" shell wm user-rotation -d 0 free >/dev/null 2>&1 ||
+        { fail "could not enable auto-rotate"; return 1; }
+      printf 'Auto-rotate enabled\n'
+      notify "Auto-rotate enabled"
+      return 0
+      ;;
+    follow)
+      # Toggle: on = the phone follows its accelerometer, off = keep the
+      # current rotation and ignore the sensor.
+      acc=$(timeout 8 adb -s "$serial" shell settings get system accelerometer_rotation 2>/dev/null | tr -d '\r' | head -n 1)
+      if [[ $acc == 1 ]]; then
+        timeout 8 adb -s "$serial" shell wm set-ignore-orientation-request -d 0 true >/dev/null 2>&1 || true
+        timeout 8 adb -s "$serial" shell settings put system accelerometer_rotation 0 >/dev/null 2>&1 || true
+        timeout 8 adb -s "$serial" shell wm user-rotation -d 0 lock >/dev/null 2>&1 ||
+          { fail "could not disable auto-rotate"; return 1; }
+        printf 'Auto-rotate off\n'
+        notify "Phone: auto-rotate off"
+      else
+        timeout 8 adb -s "$serial" shell wm set-ignore-orientation-request -d 0 false >/dev/null 2>&1 || true
+        timeout 8 adb -s "$serial" shell settings put system accelerometer_rotation 1 >/dev/null 2>&1 || true
+        timeout 8 adb -s "$serial" shell wm user-rotation -d 0 free >/dev/null 2>&1 ||
+          { fail "could not enable auto-rotate"; return 1; }
+        printf 'Auto-rotate on\n'
+        notify "Phone: auto-rotate on"
+      fi
+      return 0
+      ;;
+    portrait | landscape | toggle) ;;
+    *)
+      fail "unknown rotation '$mode' (use toggle, portrait, landscape, auto or follow)"
+      return 1
+      ;;
+  esac
+
+  size=$(display_real_size "$serial") || {
+    fail "could not read the phone display"
+    return 1
+  }
+  width=${size%%x*}
+  height=${size##*x}
+
+  if [[ $mode == toggle ]]; then
+    if ((height >= width)); then
+      target=1
+      label="landscape"
+    else
+      target=0
+      label="portrait"
+    fi
+  elif [[ $mode == landscape ]]; then
+    target=1
+    label="landscape"
+  else
+    target=0
+    label="portrait"
+  fi
+
+  was_auto=$(timeout 8 adb -s "$serial" shell settings get system accelerometer_rotation 2>/dev/null | tr -d '\r' | head -n 1)
+  was_rotation=$(timeout 8 adb -s "$serial" shell settings get system user_rotation 2>/dev/null | tr -d '\r' | head -n 1)
+  was_ignore=$(rotation_ignore "$serial")
+
+  # Launchers and Settings hard-code portrait, so tell the system to ignore app
+  # orientation requests while the manual rotation is active.
+  timeout 8 adb -s "$serial" shell wm set-ignore-orientation-request -d 0 true >/dev/null 2>&1 || true
+
+  # Freeze the accelerometer, otherwise it fights the requested rotation.
+  timeout 8 adb -s "$serial" shell settings put system accelerometer_rotation 0 >/dev/null 2>&1 || true
+  timeout 8 adb -s "$serial" shell wm user-rotation -d 0 lock "$target" >/dev/null 2>&1 ||
+    { fail "could not rotate the phone display"; return 1; }
+
+  # The display size only changes if the app in front allows that orientation.
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 0.4
+    new=$(display_real_size "$serial") || continue
+    if [[ $new != "$size" ]]; then
+      printf 'Rotated to %s\n' "$label"
+      notify "Phone: $label"
+      return 0
+    fi
+  done
+
+  # The rotation never happened, so put the phone back the way it was.
+  if [[ -n $was_rotation ]]; then
+    timeout 8 adb -s "$serial" shell settings put system user_rotation "$was_rotation" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $was_auto ]]; then
+    timeout 8 adb -s "$serial" shell settings put system accelerometer_rotation "$was_auto" >/dev/null 2>&1 || true
+  fi
+  if [[ $was_auto == 1 ]]; then
+    timeout 8 adb -s "$serial" shell wm user-rotation -d 0 free >/dev/null 2>&1 || true
+  elif [[ -n $was_rotation ]]; then
+    timeout 8 adb -s "$serial" shell wm user-rotation -d 0 lock "$was_rotation" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $was_ignore ]]; then
+    timeout 8 adb -s "$serial" shell wm set-ignore-orientation-request -d 0 "$was_ignore" >/dev/null 2>&1 || true
+  fi
+
+  if keyguard_showing "$serial"; then
+    fail "unlock the phone to rotate the screen"
+  else
+    fail "rotation did not apply — the current app may be locked to its orientation"
+  fi
+  return 1
+}
+
+cmd_usb() {
+  local usb
+  require_adb || return 1
+  usb=$(usb_serial)
+  [[ -n $usb ]] || {
+    fail "no USB device found — plug in the phone and allow USB debugging"
+    return 1
+  }
+  printf 'Enabling ADB over Wi-Fi on %s...\n' "$usb"
+  log "adb -s $usb tcpip $ADB_PORT"
+  timeout 25 adb -s "$usb" tcpip "$ADB_PORT" >/dev/null 2>&1 || {
+    fail "adb tcpip $ADB_PORT failed on $usb"
+    return 1
+  }
+  sleep 2
+  cmd_connect
+}
+
+cmd_pair() {
+  local addr=${1:-} code=${2:-} ip
+  require_adb || return 1
+
+  ip=$(detect_ip 2>/dev/null) || ip=""
+  if [[ -z $addr ]]; then
+    if [[ -n $ip ]]; then
+      addr=$(mdns_addr_for "$ip" "_adb-tls-pairing._tcp") || addr=""
+    fi
+    if [[ -z $addr ]]; then
+      addr=$(mdns_any "_adb-tls-pairing._tcp") || addr=""
+    fi
+  fi
+  [[ -n $addr ]] || {
+    fail "no pairing service found — open Developer options → Wireless debugging on the phone"
+    return 1
+  }
+
+  if [[ -z $code ]]; then
+    printf 'Pairing address: %s\n' "$addr"
+    read -r -p 'Pairing code (6 digits): ' code || true
+  fi
+  [[ -n $code ]] || {
+    fail "pairing code required"
+    return 1
+  }
+
+  timeout 60 adb pair "$addr" "$code"
+}
+
+cmd_auto() {
+  ((AUTO_RECONNECT)) || return 0
+  [[ -f $STATE_FILE ]] || return 0
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  exec 9>>"$STATE_DIR/auto.lock" 2>/dev/null || return 0
+  command -v flock >/dev/null 2>&1 && { flock -n 9 || return 0; }
+
+  local ip
+  ip=$(detect_ip 2>/dev/null) || return 0
+  [[ -n $ip ]] || return 0
+
+  [[ -n $(online_serial_for_ip "$ip") ]] && return 0
+
+  QUIET=1
+  if connect_impl "$ip" >/dev/null 2>&1; then
+    log "auto: reconnected to $CONNECTED_SERIAL (gateway $ip)"
+    notify_raw "Reconnected to $ip"
+    return 0
+  fi
+  log "auto: could not reach $ip"
+  return 1
+}
+
+cmd_devices() {
+  require_adb || return 1
+  timeout 10 adb devices -l
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+case "${1:-help}" in
+  ip) shift; cmd_ip "${1:-}" ;;
+  status) shift; cmd_status "${1:-}" ;;
+  connect) shift; cmd_connect ;;
+  disconnect) shift; cmd_disconnect ;;
+  mirror) shift; cmd_mirror ;;
+  view) shift; cmd_view "${1:-toggle}" ;;
+  rotate) shift; cmd_rotate "${1:-toggle}" ;;
+  usb) shift; cmd_usb ;;
+  pair) shift; cmd_pair "${1:-}" "${2:-}" ;;
+  auto) shift; cmd_auto ;;
+  devices) shift; cmd_devices ;;
+  help | -h | --help) usage ;;
+  *)
+    printf 'omarchy-phone: unknown command: %s\n\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
