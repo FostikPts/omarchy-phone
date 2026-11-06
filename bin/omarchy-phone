@@ -30,6 +30,11 @@ LOG_FILE="$STATE_DIR/phone.log"
 # SCRCPY_ARGS="--stay-awake --window-title=Phone --window-borderless --shortcut-mod=lctrl"
 # AUTO_RECONNECT=1               # "auto" reconnects a phone seen before
 # NOTIFY=1                       # desktop notifications
+# WINDOW_FIT=rotate              # "rotate": refit the mirror window only when the
+#                                # phone rotates or changes resolution; "never":
+#                                # never resize it automatically. A size and
+#                                # position you set by hand is always kept and
+#                                # remembered in $STATE_DIR/geometry.json.
 #
 # --turn-screen-off is deliberately not used: the screen must stay on so the
 # phone keeps following its accelerometer when it is turned sideways.
@@ -39,6 +44,7 @@ PHONE_IFACE=""
 SCRCPY_ARGS="--stay-awake --window-title=Phone --window-borderless --shortcut-mod=lctrl"
 AUTO_RECONNECT=1
 NOTIFY=1
+WINDOW_FIT="rotate"
 
 # shellcheck source=/dev/null
 [[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
@@ -473,12 +479,18 @@ ensure_serial() {
   printf '%s\n' "$serial"
 }
 
-# The watcher re-fits the scrcpy window after the phone rotates. Hyprland does
-# not let scrcpy resize itself, so the compositor has to do it.
+# The watcher remembers the window geometry and adapts it only when the phone
+# rotates. Hyprland does not let scrcpy resize itself, so the compositor does it.
 start_watch() {
-  local serial=${1-} pid_file="$STATE_DIR/watch.pid" old="" watcher script_dir
+  local serial=${1-} pid_file="$STATE_DIR/watch.pid" old="" watcher script_dir fit
   [[ -n $serial ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
+
+  fit=${WINDOW_FIT:-rotate}
+  case $fit in
+    rotate | never) ;;
+    *) fit="rotate" ;;
+  esac
 
   # Resolve the symlink in ~/.local/bin back to the plugin folder.
   script_dir=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd) || return 0
@@ -495,7 +507,9 @@ start_watch() {
   exec 8>>"$STATE_DIR/watch.lock" 2>/dev/null || return 0
   command -v flock >/dev/null 2>&1 && { flock -n 8 || return 0; }
 
-  setsid -f "$watcher" --serial "$serial" --pid-file "$pid_file" --view "$(view_angle)" >>"$LOG_FILE" 2>&1
+  setsid -f "$watcher" --serial "$serial" --pid-file "$pid_file" \
+    --view "$(view_angle)" --fit "$fit" \
+    --geometry "$STATE_DIR/geometry.json" >>"$LOG_FILE" 2>&1
 }
 
 # Workspace of the scrcpy window (empty when it is not mirrored).

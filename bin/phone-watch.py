@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Keep the scrcpy window fitted to the phone display.
+"""Keep the scrcpy window useful without fighting the user.
 
-Wayland gives a client no way to resize its own toplevel window, and Hyprland
-has no per-window rotation. So when the phone display rotates (or its size
-changes), scrcpy's video changes aspect ratio but its window keeps the old
+Wayland gives a client no way to resize or move its own toplevel window, and
+Hyprland has no per-window rotation. So when the phone display rotates (or its
+size changes), scrcpy's video changes aspect ratio but its window keeps the old
 shape. This watcher polls the mirrored display and asks Hyprland (through
-hyprctl) to resize and center the scrcpy window around the new video.
+hyprctl) for a new size, keeping the window where the user put it.
+
+Rules:
+
+* A manual resize or move is never undone. The watcher only changes the window
+  when the phone display itself changes (rotation, resolution) or on the very
+  first start when there is no saved geometry yet.
+* The window is resized around its current centre, so it does not jump back to
+  the middle of the screen.
+* The window's long side is kept across a rotation: a small window stays
+  small, it only gets the new aspect ratio.
+* The last geometry is saved to disk and restored on the next mirror run.
 
 It is started by `omarchy-phone mirror` and stops when scrcpy disappears.
 `--view` carries the client-side rotation (`omarchy-phone view`), which turns
@@ -21,9 +32,12 @@ import subprocess
 import sys
 import time
 
-DISPLAY_MARGIN = 96  # scrcpy leaves this much room around its window
+DISPLAY_MARGIN = 96  # scrcpy leaves this much room around its initial window
 POLL_INTERVAL = 1.0
 ASPECT_TOLERANCE = 0.02
+GEOMETRY_TOLERANCE = 4  # px; smaller differences are rounding, not the user
+MANUAL_CONFIRM_POLLS = 2  # save a manual change after it stays put this long
+MIN_WINDOW_SIZE = 120
 MISSING_LIMIT = 5  # consecutive polls without scrcpy before exiting
 
 _stopping = False
@@ -101,50 +115,220 @@ def dispatch(expression):
     return proc is not None and proc.returncode == 0 and "ok" in proc.stdout
 
 
-def target_size(window, content):
-    """Largest size with the content aspect that fits the monitor."""
-    monitors = hyprctl_json("monitors")
+def window_geometry(window):
+    """(x, y, width, height) of a Hyprland client in layout coordinates."""
+    at = window.get("at") or [0, 0]
+    size = window.get("size") or [0, 0]
+    try:
+        return int(at[0]), int(at[1]), int(size[0]), int(size[1])
+    except (TypeError, ValueError, IndexError):
+        return 0, 0, 0, 0
+
+
+def monitor_bounds(monitors, window):
+    """Usable layout rectangle of the monitor the window sits on."""
     if not isinstance(monitors, list) or not monitors:
         return None
     index = window.get("monitor", 0)
     monitor = monitors[index] if 0 <= index < len(monitors) else monitors[0]
     scale = monitor.get("scale") or 1.0
-    usable_width = int(monitor.get("width", 0) / scale) - DISPLAY_MARGIN
-    usable_height = int(monitor.get("height", 0) / scale) - DISPLAY_MARGIN
+    width = int(monitor.get("width", 0) / scale)
+    height = int(monitor.get("height", 0) / scale)
+    if int(monitor.get("transform", 0) or 0) % 2 == 1:
+        width, height = height, width
+
+    reserved = monitor.get("reserved") or [0, 0, 0, 0]
+    if isinstance(reserved, dict):
+        left = int(reserved.get("left", 0))
+        top = int(reserved.get("top", 0))
+        right = int(reserved.get("right", 0))
+        bottom = int(reserved.get("bottom", 0))
+    else:
+        values = list(reserved) + [0, 0, 0, 0]
+        left, top, right, bottom = (int(values[i]) for i in range(4))
+
+    x = int(monitor.get("x", 0)) + left
+    y = int(monitor.get("y", 0)) + top
+    width -= left + right
+    height -= top + bottom
+    if width <= 0 or height <= 0:
+        return None
+    return {
+        "name": monitor.get("name", ""),
+        "x": x,
+        "y": y,
+        "w": width,
+        "h": height,
+    }
+
+
+def clamp_size(width, height, bounds):
+    width = max(MIN_WINDOW_SIZE, min(int(width), bounds["w"]))
+    height = max(MIN_WINDOW_SIZE, min(int(height), bounds["h"]))
+    return width, height
+
+
+def fit_size(width, height, bounds):
+    """Shrink a size to the monitor without changing its aspect ratio."""
+    width = max(1.0, float(width))
+    height = max(1.0, float(height))
+    factor = min(1.0, bounds["w"] / width, bounds["h"] / height)
+    return clamp_size(round(width * factor), round(height * factor), bounds)
+
+
+def clamp_position(x, y, width, height, bounds):
+    max_x = bounds["x"] + bounds["w"] - width
+    max_y = bounds["y"] + bounds["h"] - height
+    x = max(bounds["x"], min(int(x), max_x))
+    y = max(bounds["y"], min(int(y), max_y))
+    return x, y
+
+
+def centered(x, y, width, height, bounds):
+    """A size centred on (x, y), clamped so it stays on screen."""
+    left = int(round(x - width / 2.0))
+    top = int(round(y - height / 2.0))
+    return clamp_position(left, top, width, height, bounds)
+
+
+def target_size(content, bounds, margin=0):
+    """Largest size with the content aspect that fits the monitor."""
+    usable_width = bounds["w"] - margin * 2
+    usable_height = bounds["h"] - margin * 2
     if usable_width <= 0 or usable_height <= 0:
         return None
-
     width, height = content
     factor = min(usable_width / width, usable_height / height)
-    return max(1, int(width * factor)), max(1, int(height * factor))
+    return clamp_size(width * factor, height * factor, bounds)
 
 
-def fits(content, size):
-    """True when the window is already shaped like the video."""
-    width, height = content
-    win_width, win_height = size
-    if win_width <= 0 or win_height <= 0:
+def size_for_rotation(content, geometry, bounds):
+    """New aspect ratio with the window's long side kept the same size.
+
+    This keeps a window the user made small small, and a maximised one
+    maximised, without letterboxed windows shrinking to a tiny strip.
+    """
+    long_side = max(geometry[2], geometry[3])
+    content_width, content_height = content
+    if content_width >= content_height:
+        width = long_side
+        height = long_side * content_height / content_width
+    else:
+        width = long_side * content_width / content_height
+        height = long_side
+    return fit_size(width, height, bounds)
+
+
+def fits_content(aspect_a, aspect_b):
+    if aspect_a <= 0 or aspect_b <= 0:
         return False
-    expected = width / height
-    actual = win_width / win_height
-    return abs(actual - expected) / expected <= ASPECT_TOLERANCE
+    return abs(aspect_a - aspect_b) / aspect_b <= ASPECT_TOLERANCE
 
 
-def fit_window(window, content):
-    size = target_size(window, content)
-    if size is None:
-        return False
+def read_geometry(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        geometry = {
+            "x": int(data["x"]),
+            "y": int(data["y"]),
+            "w": int(data["w"]),
+            "h": int(data["h"]),
+            "content_w": int(data.get("content_w", 0)),
+            "content_h": int(data.get("content_h", 0)),
+            "monitor": str(data.get("monitor", "")),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if geometry["w"] <= 0 or geometry["h"] <= 0:
+        return None
+    return geometry
+
+
+def write_geometry(path, geometry, content, bounds):
+    payload = {
+        "x": geometry[0],
+        "y": geometry[1],
+        "w": geometry[2],
+        "h": geometry[3],
+        "content_w": content[0] if content else 0,
+        "content_h": content[1] if content else 0,
+        "monitor": bounds["name"] if bounds else "",
+    }
+    directory = os.path.dirname(path)
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            return
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def apply_geometry(window, geometry):
     address = window.get("address", "")
     if not address:
         return False
     selector = 'window = "address:%s"' % address
-    resized = dispatch("hl.dsp.window.resize({ x = %d, y = %d, %s })" % (size[0], size[1], selector))
-    centered = dispatch("hl.dsp.window.center({ %s })" % selector)
-    if resized and centered:
-        log("phone %dx%d -> window %dx%d" % (content[0], content[1], size[0], size[1]))
+    x, y, width, height = geometry
+    resized = dispatch(
+        "hl.dsp.window.resize({ x = %d, y = %d, relative = false, %s })"
+        % (width, height, selector)
+    )
+    moved = dispatch(
+        "hl.dsp.window.move({ x = %d, y = %d, relative = false, %s })"
+        % (x, y, selector)
+    )
+    if resized and moved:
         return True
-    log("could not resize %s (resize=%s center=%s)" % (address, resized, centered))
-    return False
+    log(
+        "could not place %s (resize=%s move=%s)"
+        % (address, resized, moved)
+    )
+    return resized or moved
+
+
+def restored_geometry(saved, content, bounds):
+    """Saved size adapted to the current phone content and monitor."""
+    width, height = int(saved["w"]), int(saved["h"])
+    saved_content = (saved.get("content_w", 0), saved.get("content_h", 0))
+    if saved_content[0] > 0 and saved_content[1] > 0:
+        if fits_content(
+            saved_content[0] / saved_content[1], content[0] / content[1]
+        ):
+            width, height = fit_size(width, height, bounds)
+        else:
+            width, height = size_for_rotation(
+                content, (0, 0, width, height), bounds
+            )
+    else:
+        width, height = fit_size(width, height, bounds)
+
+    centre_x = saved["x"] + saved["w"] / 2.0
+    centre_y = saved["y"] + saved["h"] / 2.0
+    x, y = centered(centre_x, centre_y, width, height, bounds)
+    return x, y, width, height
+
+
+def oriented_content(serial, view):
+    content = display_size(serial)
+    if content and view in (90, 270):
+        content = (content[1], content[0])
+    return content
 
 
 def stop(signum, frame):
@@ -156,6 +340,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True, help="adb serial of the phone")
     parser.add_argument("--pid-file", help="write the watcher PID here")
+    parser.add_argument(
+        "--geometry",
+        default=os.path.expanduser("~/.local/state/omarchy-phone/geometry.json"),
+        help="where the last window geometry is remembered",
+    )
+    parser.add_argument(
+        "--fit",
+        choices=("rotate", "never"),
+        default="rotate",
+        help="refit on phone rotation/resolution change, or never touch the window",
+    )
     parser.add_argument(
         "--view",
         type=int,
@@ -176,8 +371,12 @@ def main():
             pass
 
     last_content = None
-    last_monitor = None
+    last_applied = None
+    restored = False
+    manual_candidate = None
+    manual_count = 0
     missing = 0
+
     try:
         while not _stopping:
             pids = scrcpy_pids(args.serial)
@@ -189,21 +388,138 @@ def main():
                 continue
             missing = 0
 
-            content = display_size(args.serial)
+            window = scrcpy_window(pids)
+            # A fullscreen window is controlled by the user; fit it again only
+            # after leaving fullscreen.
+            if not window or window.get("fullscreen"):
+                time.sleep(POLL_INTERVAL)
+                continue
+
             # --display-orientation turns the image, so at 90° and 270° the
             # video the window shows has the swapped aspect.
-            if content and args.view in (90, 270):
-                content = (content[1], content[0])
-            window = scrcpy_window(pids)
-            # A fullscreen window is controlled by the user; re-fit it only
-            # after leaving fullscreen.
-            if content and window and not window.get("fullscreen"):
-                monitor = window.get("monitor", 0)
-                if (content != last_content or monitor != last_monitor
-                        or not fits(content, window.get("size", (0, 0)))):
-                    if fit_window(window, content):
+            content = oriented_content(args.serial, args.view)
+            if not content:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            monitors = hyprctl_json("monitors")
+            bounds = monitor_bounds(monitors, window)
+            if not bounds:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            geometry = window_geometry(window)
+            if geometry[2] <= 0 or geometry[3] <= 0:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if not restored:
+                saved = read_geometry(args.geometry)
+                if saved is not None:
+                    wanted = restored_geometry(saved, content, bounds)
+                    if apply_geometry(window, wanted):
+                        restored = True
+                        last_applied = wanted
                         last_content = content
-                        last_monitor = monitor
+                        log(
+                            "restored %dx%d at %d,%d"
+                            % (wanted[2], wanted[3], wanted[0], wanted[1])
+                        )
+                        time.sleep(POLL_INTERVAL)
+                        continue
+
+                if args.fit == "never":
+                    restored = True
+                    last_content = content
+                    log("no saved geometry; leaving the window as it is")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                size = target_size(content, bounds, DISPLAY_MARGIN)
+                if size is not None:
+                    centre_x = bounds["x"] + bounds["w"] / 2.0
+                    centre_y = bounds["y"] + bounds["h"] / 2.0
+                    x, y = centered(centre_x, centre_y, size[0], size[1], bounds)
+                    wanted = (x, y, size[0], size[1])
+                    if apply_geometry(window, wanted):
+                        restored = True
+                        write_geometry(args.geometry, wanted, content, bounds)
+                        last_applied = wanted
+                        last_content = content
+                        log(
+                            "initial %dx%d at %d,%d"
+                            % (wanted[2], wanted[3], wanted[0], wanted[1])
+                        )
+                        time.sleep(POLL_INTERVAL)
+                        continue
+                # hyprctl did not answer yet; try again on the next poll.
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if last_content is not None and content != last_content:
+                if args.fit == "rotate":
+                    size = size_for_rotation(content, geometry, bounds)
+                    if size is not None:
+                        centre_x = geometry[0] + geometry[2] / 2.0
+                        centre_y = geometry[1] + geometry[3] / 2.0
+                        x, y = centered(
+                            centre_x, centre_y, size[0], size[1], bounds
+                        )
+                        wanted = (x, y, size[0], size[1])
+                        if apply_geometry(window, wanted):
+                            write_geometry(args.geometry, wanted, content, bounds)
+                            last_applied = wanted
+                            last_content = content
+                            log(
+                                "phone %dx%d -> window %dx%d at %d,%d"
+                                % (
+                                    content[0],
+                                    content[1],
+                                    wanted[2],
+                                    wanted[3],
+                                    wanted[0],
+                                    wanted[1],
+                                )
+                            )
+                else:
+                    last_content = content
+                manual_candidate = None
+                manual_count = 0
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Remember a resize/move the user made by hand, but only once it
+            # settles, so dragging does not write the file on every poll.
+            if last_applied is not None:
+                delta = max(
+                    abs(geometry[i] - last_applied[i]) for i in range(4)
+                )
+                if delta > GEOMETRY_TOLERANCE:
+                    if (
+                        manual_candidate is not None
+                        and max(
+                            abs(geometry[i] - manual_candidate[i])
+                            for i in range(4)
+                        )
+                        <= GEOMETRY_TOLERANCE
+                    ):
+                        manual_count += 1
+                    else:
+                        manual_candidate = geometry
+                        manual_count = 1
+                    if manual_count >= MANUAL_CONFIRM_POLLS:
+                        write_geometry(args.geometry, geometry, content, bounds)
+                        last_applied = geometry
+                        manual_candidate = None
+                        manual_count = 0
+                        log(
+                            "saved manual %dx%d at %d,%d"
+                            % (geometry[2], geometry[3], geometry[0], geometry[1])
+                        )
+                else:
+                    manual_candidate = None
+                    manual_count = 0
+
             time.sleep(POLL_INTERVAL)
     finally:
         if args.pid_file:

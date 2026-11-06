@@ -45,7 +45,7 @@ gateway). If the phone is on the same Wi-Fi as the computer instead, pair once:
 ├── Model.js             # status parsing, labels, action list
 └── bin/
     ├── omarchy-phone    # the CLI (symlinked to ~/.local/bin/omarchy-phone)
-    └── phone-watch.py   # re-fits the scrcpy window when the phone rotates
+    └── phone-watch.py   # keeps the scrcpy window size the user chose
 ```
 
 ## CLI
@@ -82,15 +82,22 @@ The first run on a new phone needs one of the two one-time setups:
 
 ## Mirror window and rotation
 
-The scrcpy window is borderless, floating and centred (window rules for class
-`^scrcpy$` in `~/.config/hypr/windows.lua`). It is sized to the phone screen:
-the phone decides the aspect ratio, the plugin makes the window match it.
+The scrcpy window is borderless and floating (window rules for class
+`^scrcpy$` in `~/.config/hypr/windows.lua`). The phone decides the aspect
+ratio; on the first run the plugin sizes the window to fit it.
 
 Neither Wayland nor Hyprland lets a client resize or rotate its own window, so
-`mirror` starts `bin/phone-watch.py`. It polls the mirrored display and, when
-the phone rotates, asks Hyprland (`hyprctl`) to resize and re-centre the scrcpy
-window. The window follows both a physical rotation (with auto-rotate on) and a
-manual `rotate`, usually within a second.
+`mirror` starts `bin/phone-watch.py`. It does **not** fight the user: resize or
+move the window however you like and it stays that way. The watcher only reacts
+when the phone display itself changes (rotation or resolution), and then it
+keeps the window's long side and centre instead of jumping back to the middle
+of the screen. The window follows both a physical rotation (with
+auto-rotate on) and a manual `rotate`, usually within a second.
+
+Your last size and position are remembered in
+`~/.local/state/omarchy-phone/geometry.json` and restored by the next `mirror`.
+Set `WINDOW_FIT=never` in `~/.config/omarchy-phone/config` to stop automatic
+refitting on rotation entirely.
 
 `omarchy-phone rotate` locks the orientation the same way a rotation lock does:
 it switches between portrait and landscape. It also tells Android to ignore
@@ -141,13 +148,15 @@ PHONE_IFACE=""                                   # force an interface (e.g. wlp3
 SCRCPY_ARGS="--stay-awake --window-title=Phone --window-borderless --shortcut-mod=lctrl"
 AUTO_RECONNECT=1                                 # 0 disables `omarchy-phone auto`
 NOTIFY=1                                         # 0 disables notifications
+WINDOW_FIT="rotate"                              # rotate | never (see below)
 ```
 
 `PHONE_IFACE` is only needed when several default routes exist and the
 automatic wireless-interface preference picks the wrong one (an unusual VPN
 setup).
 
-State lives in `~/.local/state/omarchy-phone/` (`state`, `phone.log`).
+State lives in `~/.local/state/omarchy-phone/` (`state`, `geometry.json`,
+`view`, `phone.log`).
 `omarchy-phone disconnect` clears the state, which also stops auto-reconnect
 until the next manual connect.
 
